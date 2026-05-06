@@ -1,242 +1,101 @@
-from __future__ import print_function
+import os
+from datetime import datetime
+from dotenv import load_dotenv
+from notion_client import Client
+import json
+from ai import generate_cover_letter
 
-import base64
-import os.path
+load_dotenv()
 
-from bs4 import BeautifulSoup
+NOTION_TOKEN = os.getenv("NOTION_TOKEN")
+DATABASE_ID = os.getenv("DATABASE_ID")
 
-from google.auth.transport.requests import Request
-from google.oauth2.credentials import Credentials
-from google_auth_oauthlib.flow import InstalledAppFlow
-from googleapiclient.discovery import build
-from sheets import save_jobs_to_sheet
-from notion_db import save_jobs_to_notion
+notion = Client(auth=NOTION_TOKEN)
 
-SCOPES = [
-    "https://www.googleapis.com/auth/gmail.readonly",
-    "https://www.googleapis.com/auth/spreadsheets",
-]
+SAVED_JOBS_FILE = "saved_jobs.json"
 
-ROLE_KEYWORDS = [
-    "python",
-    "django",
-    "backend",
-    "back end",
-    "software engineer",
-    "software developer",
-    "web developer",
-    "drf",
-    "api",
-]
+# --- Local duplicate tracking ---
+def load_saved_job_ids():
+    if not os.path.exists(SAVED_JOBS_FILE):
+        return set()
+    with open(SAVED_JOBS_FILE, "r", encoding="utf-8") as file:
+        return set(json.load(file))
 
-BANGLADESH_KEYWORDS = [
-    "bangladesh",
-    "dhaka",
-    "chattogram",
-    "chittagong",
-    "mirpur",
-]
+def save_job_ids(job_ids):
+    with open(SAVED_JOBS_FILE, "w", encoding="utf-8") as file:
+        json.dump(list(job_ids), file, indent=2)
 
-REMOTE_KEYWORDS = [
-    "remote",
-]
-
-def get_gmail_service():
-    creds = None
-
-    if os.path.exists("token.json"):
-        creds = Credentials.from_authorized_user_file(
-            "token.json",
-            SCOPES,
-        )
-
-    if not creds or not creds.valid:
-        if creds and creds.expired and creds.refresh_token:
-            creds.refresh(Request())
-
-        else:
-            flow = InstalledAppFlow.from_client_secrets_file(
-                "credentials.json",
-                SCOPES,
-            )
-
-            creds = flow.run_local_server(port=0)
-
-        with open("token.json", "w") as token:
-            token.write(creds.to_json())
-
-    return build("gmail", "v1", credentials=creds)
-
-
-def extract_html(payload):
-    parts = payload.get("parts", [])
-
-    for part in parts:
-        if part["mimeType"] == "text/html":
-            data = part["body"]["data"]
-
-            decoded_data = base64.urlsafe_b64decode(data)
-
-            return decoded_data.decode("utf-8")
-
-    return None
-
-
-def clean_link(url: str) -> str:
-    return url.split("?")[0]
-
-
-def clean_title(title: str) -> str:
-    return " ".join(title.split())
-
-def is_relevant_job(title: str) -> bool:
-    title = title.lower()
-
-    return any(
-        keyword in title
-        for keyword in ROLE_KEYWORDS
+# --- Get jobs manually checked for AI cover letter generation ---
+def get_jobs_to_generate():
+    response = notion.databases.query(
+        database_id=DATABASE_ID,
+        filter={
+            "and": [
+                {"property": "Generate Cover Letter", "checkbox": {"equals": True}},
+                {"property": "Cover Letter Generated", "checkbox": {"equals": False}}
+            ]
+        }
     )
-
-def is_allowed_location(text: str) -> bool:
-    text = text.lower()
-
-    is_remote = any(keyword in text for keyword in REMOTE_KEYWORDS)
-    is_bangladesh = any(keyword in text for keyword in BANGLADESH_KEYWORDS)
-
-    if is_remote:
-        return True
-
-    return is_bangladesh
-
-
-
-def parse_jobs_from_html(html):
-    soup = BeautifulSoup(html, "html.parser")
-
     jobs = []
-    seen_job_ids = set()
+    for page in response.get("results", []):
+        job = {
+            "title": page["properties"]["Title"]["title"][0]["text"]["content"],
+            "company": page["properties"].get("Company", {}).get("rich_text", [{}])[0].get("text", {}).get("content", ""),
+            "location": page["properties"].get("Location", {}).get("rich_text", [{}])[0].get("text", {}).get("content", ""),
+            "job_id": page["properties"]["Job ID"]["rich_text"][0]["text"]["content"],
+            "link": page["properties"]["Link"]["url"]
+        }
+        jobs.append((job, page["id"]))  # Keep page ID for updating later
+    return jobs
 
-    links = soup.find_all("a")
-
-    for link in links:
-        href = link.get("href", "")
-        title = clean_title(link.get_text(" ", strip=True))
-        job_card = link.find_parent(attrs={"data-test-id": "job-card"})
-
-        if not job_card:
-            continue
-
-        card_text = clean_title(job_card.get_text(" ", strip=True))
-
-        if "/jobs/view/" not in href:
-            continue
-
-        # only real job title link accept korbo
-        if "jobcard_body" not in href:
-            continue
-
-        clean_url = clean_link(href)
-
+# --- Generate AI cover letters only for selected jobs ---
+def generate_and_save_cover_letters():
+    jobs = get_jobs_to_generate()
+    for job, page_id in jobs:
         try:
-            job_id = clean_url.split("/jobs/view/")[1].strip("/")
-        except IndexError:
+            cover_letter = generate_cover_letter(job)
+            notion.pages.update(
+                page_id=page_id,
+                properties={
+                    "Cover Letter": {"rich_text": [{"text": {"content": cover_letter[:1900]}}]},
+                    "Cover Letter Generated": {"checkbox": True},
+                    "Generate Cover Letter": {"checkbox": False}
+                }
+            )
+            print(f"Cover letter generated for: {job['title']}")
+        except Exception as e:
+            print(f"Failed for {job['title']}: {e}")
+
+# --- Save new jobs to Notion (without auto AI generation) ---
+def save_jobs_to_notion(jobs):
+    saved_job_ids = load_saved_job_ids()
+    saved_count = 0
+
+    for job in jobs:
+        if job["job_id"] in saved_job_ids:
             continue
 
-        if job_id in seen_job_ids:
-            continue
-
-        if len(title) < 5:
-            continue
-
-        if not is_relevant_job(title):
-            continue
-
-        if not is_allowed_location(card_text):
-            continue
-
-        seen_job_ids.add(job_id)
-
-        parts = card_text.split(title)
-
-        extra_text = ""
-
-        if len(parts) > 1:
-            extra_text = parts[1].strip()
-
-        company = ""
-        location = ""
-
-        extra_parts = extra_text.split("·")
-
-        if len(extra_parts) >= 1:
-            company = extra_parts[0].strip()
-
-        if len(extra_parts) >= 2:
-            location = extra_parts[1].strip()
-
-        jobs.append(
-            {
-                "job_id": job_id,
-                "title": title,
-                "company": company,
-                "location": location,
-                "link": clean_url,
+        # Do NOT generate AI cover letter here, only save job
+        notion.pages.create(
+            parent={"database_id": DATABASE_ID},
+            properties={
+                "Title": {"title": [{"text": {"content": job["title"]}}]},
+                "Company": {"rich_text": [{"text": {"content": job.get("company", "")}}]},
+                "Location": {"rich_text": [{"text": {"content": job.get("location", "")}}]},
+                "Cover Letter": {"rich_text": [{"text": {"content": ""}}]},  # empty initially
+                "Job ID": {"rich_text": [{"text": {"content": job["job_id"]}}]},
+                "Link": {"url": job["link"]},
+                "Status": {"select": {"name": "New"}},
+                "Source": {"select": {"name": "LinkedIn"}},
+                "Priority": {"select": {"name": "Medium"}},
+                "Date Added": {"date": {"start": datetime.now().isoformat()}},
+                "Generate Cover Letter": {"checkbox": False},
+                "Cover Letter Generated": {"checkbox": False}
             }
         )
 
-    return jobs
+        saved_job_ids.add(job["job_id"])
+        saved_count += 1
 
-
-def get_linkedin_jobs(service):
-    results = service.users().messages().list(
-        userId="me",
-        q="from:jobs-listings@linkedin.com",
-        maxResults=5,
-    ).execute()
-
-    messages = results.get("messages", [])
-
-    if not messages:
-        print("No LinkedIn emails found.")
-        return
-
-    all_jobs = []
-    seen_job_ids = set()
-
-    for msg in messages:
-        message = service.users().messages().get(
-            userId="me",
-            id=msg["id"],
-        ).execute()
-
-        html = extract_html(message["payload"])
-
-        if not html:
-            continue
-
-        jobs = parse_jobs_from_html(html)
-
-        for job in jobs:
-
-            # current run duplicate skip
-            if job["job_id"] in seen_job_ids:
-                continue
-
-            seen_job_ids.add(job["job_id"])
-
-            all_jobs.append(job)
-
-
-    print("\nFound Jobs:\n")
-
-    for job in all_jobs:
-        print("Title:", job["title"])
-        print("Link :", job["link"])
-        print("-" * 50)
-
-    save_jobs_to_notion(all_jobs)
-
-
-if __name__ == "__main__":
-    service = get_gmail_service()
-    get_linkedin_jobs(service)
+    save_job_ids(saved_job_ids)
+    print(f"Saved {saved_count} new jobs to Notion.")
