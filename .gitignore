@@ -1,0 +1,9 @@
+.env
+token.json
+n.txt
+saved_jobs.json
+credentials.json
+venv/
+__pycache__/
+venv
+__pycache__/
