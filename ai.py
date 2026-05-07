@@ -18,6 +18,7 @@ def read_resume():
         return file.read()
 
 
+
 def generate_cover_letter(job):
     resume_text = read_resume()
 
